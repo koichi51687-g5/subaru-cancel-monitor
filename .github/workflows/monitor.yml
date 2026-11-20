@@ -1,8 +1,12 @@
 name: SUBARU 1月11日 空席監視
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/monitor.yml'
   schedule:
-    - cron: '7,22,37,52 * * * *'
+    - cron: '11,26,41,56 * * * *'
   workflow_dispatch:
     inputs:
       dry_run:
@@ -56,7 +60,7 @@ jobs:
         id: monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
+          DRY_RUN: ${{ (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.dry_run == true)) && 'true' || 'false' }}
         run: |
           node --input-type=module <<'NODE'
           import { chromium } from 'playwright';
