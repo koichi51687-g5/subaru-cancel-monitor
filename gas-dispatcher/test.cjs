@@ -1,28 +1,23 @@
-// Local, offline tests for Code.gs (no Google/GitHub/ntfy credentials needed).
+// Offline tests of Code.gs. No real GitHub, Google, or Gmail credentials.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const vm = require('node:vm');
 
 const code = fs.readFileSync(__dirname + '/Code.gs', 'utf8');
 const start = Date.parse('2026-11-20T14:00:00Z');
-let now = start;
-let latestSuccess = 0;
-let posts = [];
-let triggers = [];
-let failDispatch = false;
-let props = new Map([
-  ['GITHUB_TOKEN', 'fake-github-token'],
-  ['NTFY_TOPIC', 'a-random-test-topic-1234567890'],
-]);
+let now = start, latestSuccess = 0, failDispatch = false, failMail = false;
+let posts = [], emails = [], triggers = [];
+const props = new Map([['GITHUB_TOKEN', 'dummy-token'], ['ALERT_EMAIL', 'me@example.com']]);
 
-class FakeDate extends Date {
-  static now() { return now; }
-}
+class FakeDate extends Date { static now() { return now; } }
 const propertyObject = {
   getProperty: key => props.get(key) ?? null,
   setProperty: (key, value) => props.set(key, value),
   deleteProperty: key => props.delete(key),
 };
+function reply(code, body) {
+  return { getResponseCode: () => code, getContentText: () => body };
+}
 const ctx = {
   Date: FakeDate,
   console: { log() {}, error() {} },
@@ -39,6 +34,12 @@ const ctx = {
       }),
     }),
   },
+  MailApp: {
+    sendEmail(message) {
+      if (failMail) throw Error('simulated email service failure');
+      emails.push(message);
+    },
+  },
   UrlFetchApp: {
     fetch(url, options) {
       posts.push({ url, options });
@@ -48,60 +49,65 @@ const ctx = {
           updated_at: new Date(latestSuccess).toISOString(),
         }] : [] }));
       }
-      if (url.includes('/dispatches')) {
-        return reply(failDispatch ? 403 : 204, '');
-      }
-      if (url === 'https://ntfy.sh/') return reply(200, '{}');
-      throw new Error('Unexpected URL: ' + url);
+      if (url.includes('/dispatches')) return reply(failDispatch ? 403 : 204, '');
+      throw Error('Unexpected URL: ' + url);
     },
   },
 };
-function reply(code, body) { return { getResponseCode: () => code, getContentText: () => body }; }
-
 vm.runInNewContext(code, ctx, { filename: 'Code.gs' });
 
-// Both self-tests should be explicitly labeled, and no production dispatch occurs.
-ctx.testNtfyNotification();
+ctx.testEmailNotification();
+assert.equal(emails.length, 1);
+assert.match(emails[0].subject, /Gmailテスト/);
+assert.equal(emails[0].to, 'me@example.com');
 ctx.testGitHubConnection();
 assert.equal(posts.filter(x => x.url.endsWith('/dispatches')).length, 1);
 assert.equal(JSON.parse(posts.find(x => x.url.endsWith('/dispatches')).options.payload).inputs.dry_run, 'true');
-assert.match(posts.find(x => x.url === 'https://ntfy.sh/').options.payload, /テスト/);
 
-// Setup is idempotent and schedules once every 15 minutes.
 ctx.setupMonitor();
 ctx.setupMonitor();
 assert.equal(triggers.length, 1);
 assert.equal(triggers[0].minutes, 15);
 
-// Triggering calls GitHub with dry_run=false (required for real availability alerts).
 posts = [];
 ctx.monitorTick();
 assert.equal(JSON.parse(posts.find(x => x.url.endsWith('/dispatches')).options.payload).inputs.dry_run, 'false');
 
-// When no successful monitoring run has happened for >45 minutes, alert only once.
 now = start + 46 * 60 * 1000;
-posts = [];
+posts = []; emails = [];
 ctx.monitorTick();
-assert.equal(posts.filter(x => x.url === 'https://ntfy.sh/').length, 1);
-posts = [];
-ctx.monitorTick();
-assert.equal(posts.filter(x => x.url === 'https://ntfy.sh/').length, 0);
+assert.equal(emails.length, 1);
+assert.match(emails[0].subject, /異常/);
+assert.equal(posts.filter(x => x.url.endsWith('/dispatches')).length, 1);
 
-// A fresh completed success clears alert state and sends one recovery message.
-latestSuccess = now - 30 * 1000;
-posts = [];
+posts = []; emails = [];
 ctx.monitorTick();
-assert.equal(posts.filter(x => x.url === 'https://ntfy.sh/').length, 1);
+assert.equal(emails.length, 0);
+
+latestSuccess = now - 30 * 1000;
+posts = []; emails = [];
+ctx.monitorTick();
+assert.equal(emails.length, 1);
+assert.match(emails[0].subject, /復旧/);
 assert.equal(props.has('MONITOR_ALERTED'), false);
 
-// GitHub rejection produces an independent alarm and propagates the failure.
 failDispatch = true;
-posts = [];
+posts = []; emails = [];
 assert.throws(() => ctx.monitorTick(), /HTTP 403/);
-assert.equal(posts.filter(x => x.url === 'https://ntfy.sh/').length, 1);
+assert.equal(emails.length, 1);
+assert.match(emails[0].subject, /異常/);
 failDispatch = false;
 
-// Expiry prevents dispatch and deletes all installed monitor triggers.
+// Regression: a Gmail outage must not prevent a real availability check.
+props.delete('MONITOR_ALERTED');
+latestSuccess = 0;
+now = start + 47 * 60 * 1000;
+failMail = true;
+posts = [];
+assert.doesNotThrow(() => ctx.monitorTick());
+assert.equal(posts.filter(x => x.url.endsWith('/dispatches')).length, 1);
+failMail = false;
+
 now = Date.parse('2027-01-11T00:00:00Z');
 posts = [];
 ctx.monitorTick();
