@@ -22,13 +22,28 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 7
     steps:
+      - name: Check monitoring period
+        id: period
+        shell: bash
+        run: |
+          cutoff=$(date -u -d '2027-01-11T09:00:00+09:00' +%s)
+          now=$(date -u +%s)
+          if [ "$now" -ge "$cutoff" ]; then
+            echo 'active=false' >> "$GITHUB_OUTPUT"
+            echo '2027-01-11 09:00 JST reached; browser setup and reservation check are skipped.'
+          else
+            echo 'active=true' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prepare browser
+        if: steps.period.outputs.active == 'true'
         run: |
           npm init -y
           npm install --no-save --no-audit --no-fund playwright@1.56.1
           npx playwright install --with-deps chromium
 
       - name: Restore last notification state
+        if: steps.period.outputs.active == 'true'
         uses: actions/cache/restore@v4
         with:
           path: .subaru-state
@@ -37,6 +52,7 @@ jobs:
             subaru-state-
 
       - name: Read the official reservation calendar
+        if: steps.period.outputs.active == 'true'
         id: monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
