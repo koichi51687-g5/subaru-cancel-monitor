@@ -1,0 +1,39 @@
+name: SUBARU 通知経路テスト（空席ではありません）
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test_notification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 3
+    steps:
+      - name: Send harmless test notification to ntfy
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "$NTFY_TOPIC" =~ ^[A-Za-z0-9_-]{20,100}$ ]]; then
+            echo "::error::NTFY_TOPIC GitHub secret is not configured correctly"
+            exit 1
+          fi
+          payload=$(jq -nc --arg topic "$NTFY_TOPIC" '{
+            topic: $topic,
+            title: "SUBARU監視：GitHub通知テスト",
+            message: "GitHub Actionsからの通知テストです。空席が発生したという意味ではありません。",
+            priority: 3
+          }')
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --max-time 20 \
+            --header 'Content-Type: application/json' \
+            --data-binary "$payload" \
+            https://ntfy.sh/)
+          if [[ ! "$status" =~ ^2[0-9][0-9]$ ]]; then
+            echo "::error::ntfy test notification failed: HTTP $status"
+            exit 1
+          fi
+          echo "GitHub-to-ntfy test notification accepted (not an availability alert)"
