@@ -1,0 +1,164 @@
+name: SUBARU 1月11日 空席監視
+
+on:
+  schedule:
+    - cron: '7,22,37,52 * * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: '確認だけを行う（通知を送らない）'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subaru-cancel-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 7
+    steps:
+      - name: Prepare browser
+        run: |
+          npm init -y
+          npm install --no-save --no-audit --no-fund playwright@1.56.1
+          npx playwright install --with-deps chromium
+
+      - name: Restore last notification state
+        uses: actions/cache/restore@v4
+        with:
+          path: .subaru-state
+          key: subaru-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            subaru-state-
+
+      - name: Read the official reservation calendar
+        id: monitor
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run == true && 'true' || 'false' }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { chromium } from 'playwright';
+          import { readFile, writeFile, mkdir, appendFile } from 'node:fs/promises';
+
+          const URL = 'https://subaru-factory.resv.jp/reserve/calendar.php';
+          const DATE = 'span.month-to-day[onclick="changeViewModeDay(2027,1,11)"]';
+          const STATE = '.subaru-state/last.json';
+          const DRY = process.env.DRY_RUN === 'true';
+          const stamp = () => new Intl.DateTimeFormat('ja-JP', {
+            timeZone: 'Asia/Tokyo', year: 'numeric', month: '2-digit',
+            day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+          }).format(new Date());
+
+          async function inspect() {
+            let browser;
+            try {
+              browser = await chromium.launch({ headless: true });
+              const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
+              await page.goto(URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+              await page.locator('#mplan_select').waitFor({ timeout: 15000 });
+              await page.locator('#mplan_select').selectOption('8');
+              await page.waitForFunction(() => {
+                const links = [...document.querySelectorAll('a.detail_link')];
+                return document.querySelector('#mplan_select')?.value === '8' &&
+                  links.length > 0 && links.every(a => a.textContent.trim() === '個人のお客様');
+              }, null, { timeout: 20000 });
+
+              let found = (await page.locator(DATE).count()) === 1;
+              for (let i = 0; i < 4 && !found; i++) {
+                const next = page.locator('a:has(i.fa-chevron-right)');
+                if ((await next.count()) !== 1) return { status: 'unknown', why: '月送りボタン不明' };
+                await next.click();
+                await page.waitForTimeout(1400);
+                found = (await page.locator(DATE).count()) === 1;
+              }
+              if (!found) return { status: 'unknown', why: '対象日が見つかりません' };
+
+              const slots = await page.locator(DATE).evaluate(day => {
+                const cell = day.closest('td');
+                if (!cell) return null;
+                return [...cell.querySelectorAll('ul.data-month')].map(ul => {
+                  const info = ul.querySelector('.data-month-block')?.textContent ?? '';
+                  const time = info.match(/\d{1,2}:\d{2}\s*[-‐‑‒–—―－〜～]\s*\d{1,2}:\d{2}/)?.[0] ?? '';
+                  const classes = [...ul.querySelectorAll('li.data-month-info span')]
+                    .map(el => String(el.className)).join(' ');
+                  return {
+                    course: ul.querySelector('a.detail_link')?.textContent?.trim() ?? '',
+                    time: time.replace(/\s+/g, '').replace(/[‐‑‒–—―－〜～]/g, '-').replace(/^09:/, '9:'),
+                    remain: ul.querySelector('.zannsu')?.textContent?.trim() ?? '',
+                    full: /\bicon-full\b/.test(classes),
+                    unavailable: /\bicon-(?:closed|unavailable|not-accept|none)\b/.test(classes),
+                  };
+                });
+              });
+              if (!Array.isArray(slots)) return { status: 'unknown', why: '日付欄の取得失敗' };
+              const matching = slots.filter(s => s.course === '個人のお客様' && s.time === '9:00-10:45');
+              if (matching.length !== 1) return { status: 'unknown', why: '対象枠が一意ではありません' };
+              const s = matching[0];
+              if (!/^\d+$/.test(s.remain)) return { status: 'unknown', why: '残数が読めません' };
+              const remain = Number(s.remain);
+              if (remain >= 2 && (s.full || s.unavailable))
+                return { status: 'unknown', why: '満席表示と残数が矛盾' };
+              return { status: remain >= 2 ? 'open' : 'closed', remain };
+            } catch (error) {
+              return { status: 'unknown', why: String(error?.message ?? error).slice(0, 200) };
+            } finally {
+              if (browser) await browser.close();
+            }
+          }
+
+          async function readState() {
+            try { return JSON.parse(await readFile(STATE, 'utf8'))?.wasOpen === true; }
+            catch { return false; }
+          }
+          async function saveState(wasOpen) {
+            await mkdir('.subaru-state', { recursive: true });
+            await writeFile(STATE, JSON.stringify({ wasOpen }) + '\n');
+            if (process.env.GITHUB_OUTPUT)
+              await appendFile(process.env.GITHUB_OUTPUT, 'state_changed=true\n');
+          }
+          async function notify(remaining, checked) {
+            const topic = process.env.NTFY_TOPIC ?? '';
+            if (!/^[A-Za-z0-9_-]{20,100}$/.test(topic)) throw Error('NTFY_TOPIC is not configured');
+            const response = await fetch('https://ntfy.sh/', {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                topic, priority: 5, title: 'SUBARU工場見学：2名分空きあり',
+                message: `2027年1月11日(月・祝)9:00〜10:45\n個人のお客様・残${remaining}\n${checked}（日本時間）\n予約は公式サイトでご本人が行ってください。`,
+                click: URL,
+              }),
+              signal: AbortSignal.timeout(12000),
+            });
+            if (!response.ok) throw Error(`通知サービスHTTP ${response.status}`);
+          }
+
+          const checked = stamp();
+          if (Date.now() >= Date.parse('2027-01-11T09:00:00+09:00')) {
+            console.log(`${checked} JST | EXPIRED`);
+          } else {
+            const result = await inspect();
+            console.log(`${checked} JST | ${result.status.toUpperCase()} | ${result.remain ?? result.why}`);
+            if (!DRY && result.status !== 'unknown') {
+              const wasOpen = await readState();
+              if (result.status === 'open' && !wasOpen) {
+                await notify(result.remain, checked);
+                await saveState(true);
+                console.log('空席通知を送信しました');
+              } else if (result.status === 'closed' && wasOpen) {
+                await saveState(false);
+              }
+            }
+          }
+          NODE
+
+      - name: Save changed notification state
+        if: steps.monitor.outputs.state_changed == 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: .subaru-state
+          key: subaru-state-${{ github.run_id }}-${{ github.run_attempt }}
