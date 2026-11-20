@@ -1,7 +1,7 @@
 /**
  * SUBARU factory tour cancellation monitor: external GitHub Actions scheduler.
  * Create a private, standalone Google Apps Script project and paste this file.
- * Store GITHUB_TOKEN and NTFY_TOPIC in Project Settings > Script properties.
+ * Store GITHUB_TOKEN and ALERT_EMAIL in Project Settings > Script properties.
  */
 
 const SUBARU = Object.freeze({
@@ -16,7 +16,7 @@ const SUBARU = Object.freeze({
 
 const PROPS = Object.freeze({
   token: 'GITHUB_TOKEN',
-  topic: 'NTFY_TOPIC',
+  email: 'ALERT_EMAIL',
   start: 'MONITOR_STARTED_AT',
   alerted: 'MONITOR_ALERTED',
 });
@@ -24,12 +24,12 @@ const PROPS = Object.freeze({
 function getConfig_() {
   const props = PropertiesService.getScriptProperties();
   const token = props.getProperty(PROPS.token) || '';
-  const topic = props.getProperty(PROPS.topic) || '';
+  const email = (props.getProperty(PROPS.email) || '').trim();
   if (!token) throw new Error('Script property GITHUB_TOKEN is missing');
-  if (!/^[A-Za-z0-9_-]{20,100}$/.test(topic)) {
-    throw new Error('Script property NTFY_TOPIC is missing or invalid');
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    throw new Error('Script property ALERT_EMAIL is missing or invalid');
   }
-  return { props, token, topic };
+  return { props, token, email };
 }
 
 function github_(token, path, method, payload) {
@@ -78,37 +78,38 @@ function lastGoodRun_(token) {
   }, 0);
 }
 
-function ntfy_(topic, title, message, priority) {
-  const res = UrlFetchApp.fetch('https://ntfy.sh/', {
-    method: 'post',
-    contentType: 'application/json',
-    muteHttpExceptions: true,
-    payload: JSON.stringify({
-      topic: topic,
-      title: title,
-      message: message,
-      priority: priority,
-      click: 'https://github.com/' + SUBARU.owner + '/' + SUBARU.repo + '/actions',
-    }),
+/** Send only monitoring-health messages by Gmail; booking alerts stay in GitHub Actions. */
+function mail_(cfg, title, message) {
+  MailApp.sendEmail({
+    to: cfg.email,
+    subject: title,
+    body: message + '\n実行履歴: https://github.com/' + SUBARU.owner + '/' + SUBARU.repo + '/actions',
+    name: 'SUBARU空席監視',
   });
-  if (res.getResponseCode() < 200 || res.getResponseCode() >= 300) {
-    throw new Error('ntfy alert failed: HTTP ' + res.getResponseCode());
-  }
 }
 
 function alertOnce_(cfg, reason) {
   if (cfg.props.getProperty(PROPS.alerted) === '1') return;
-  ntfy_(cfg.topic, 'SUBARU空席監視：異常', reason + '\nGitHubの実行履歴を確認してください。', 4);
+  mail_(cfg, 'SUBARU空席監視：異常', reason);
   cfg.props.setProperty(PROPS.alerted, '1');
+}
+
+/** Alert failures must never prevent the next real reservation check. */
+function safeAlert_(cfg, reason) {
+  try {
+    alertOnce_(cfg, reason);
+  } catch (e) {
+    console.error('Health email could not be delivered: ' + e.message);
+  }
 }
 
 function clearAlert_(cfg) {
   if (cfg.props.getProperty(PROPS.alerted) !== '1') return;
   cfg.props.deleteProperty(PROPS.alerted);
   try {
-    ntfy_(cfg.topic, 'SUBARU空席監視：復旧', '監視ジョブの正常終了を再び確認しました。', 3);
+    mail_(cfg, 'SUBARU空席監視：復旧', '監視ジョブの正常終了を再び確認しました。');
   } catch (e) {
-    console.error('Recovery alert could not be delivered: ' + e.message);
+    console.error('Recovery email could not be delivered: ' + e.message);
   }
 }
 
@@ -120,14 +121,15 @@ function testGitHubConnection() {
   console.log('Dry-run dispatched. Check the GitHub Actions run log for CLOSED / OPEN.');
 }
 
-/** Send a clearly labeled test notification to the same ntfy topic as the monitor. */
-function testNtfyNotification() {
+/** Send a clearly labeled monitoring-health test email. It is NOT an availability alert. */
+function testEmailNotification() {
   const cfg = getConfig_();
-  ntfy_(cfg.topic, 'SUBARU監視：テスト', 'GASからの異常通知テストです。空席発生ではありません。', 3);
-  console.log('Test alert sent');
+  mail_(cfg, 'SUBARU空席監視：Gmailテスト（空席ではありません）',
+        'Apps Scriptからの障害通知テストです。空席が発生したという意味ではありません。');
+  console.log('Health test email sent');
 }
 
-/** Run once manually after both tests succeed. Does not create duplicate triggers. */
+/** Run once manually after both Gmail and GitHub tests succeed. Does not create duplicate triggers. */
 function setupMonitor() {
   getConfig_();
   if (Date.now() >= SUBARU.endUtc) throw new Error('Monitoring period has expired');
@@ -164,15 +166,14 @@ function monitorTick() {
       if (lastRelevantSuccess && now - lastRelevantSuccess <= SUBARU.maxWithoutSuccessMs) {
         clearAlert_(cfg);
       } else if (now - Math.max(started, lastRelevantSuccess) >= SUBARU.maxWithoutSuccessMs) {
-        alertOnce_(cfg, '45分以上、空席確認ジョブの正常終了を確認できません。');
+        safeAlert_(cfg, '45分以上、空席確認ジョブの正常終了を確認できません。');
       }
 
       dispatchRun_(cfg.token, false);
       console.log('Production monitoring run requested at ' + new Date(now).toISOString());
     } catch (e) {
       // This notification originates outside GitHub, so even a GitHub outage is visible.
-      try { alertOnce_(cfg, '監視ジョブを起動・確認できません: ' + e.message); }
-      catch (notifyError) { console.error('Failed to alert: ' + notifyError.message); }
+      safeAlert_(cfg, '監視ジョブを起動・確認できません: ' + e.message);
       throw e;
     }
   } finally {
