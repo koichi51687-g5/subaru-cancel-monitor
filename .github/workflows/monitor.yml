@@ -163,7 +163,10 @@ jobs:
           } else {
             const result = await inspect();
             console.log(`${checked} JST | ${result.status.toUpperCase()} | ${result.remain ?? result.why}`);
-            if (!DRY && result.status !== 'unknown') {
+            if (result.status === 'unknown') {
+              throw new Error('Reservation availability could not be verified: ' + result.why);
+            }
+            if (!DRY) {
               const wasOpen = await readState();
               if (result.status === 'open' && !wasOpen) {
                 await notify(result.remain, checked);
